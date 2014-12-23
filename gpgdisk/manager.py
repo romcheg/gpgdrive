@@ -15,376 +15,119 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import subprocess
+import errno
+import logging
+import os
+import shutil
+import sys
+import tarfile
+import tempfile
+import threading
 
-import llfuse
+import fuse
 
-from gpgdisk import utils
 
+class DiskManager(fuse.LoggingMixIn, fuse.Operations):
 
-class MountManager(llfuse.Operations):
-    def init(self):
-        '''Initialize FS
+    def __init__(self, disk_file_path):
+        super(DiskManager, self).__init__()
 
-        Attaches required amount of RAM as a devise and
-        initializes GPG.
+        self.log.setLevel(logging.DEBUG)
+        self.log.addHandler(logging.StreamHandler(sys.stdout))
 
-        '''
-        self.volume_label = 'GPG Disk'
+        self.rwlock = threading.Lock()
 
-        cmd = 'hdiutil attach -nomount ram://1048576'
-        ret_code, stdout, stderr = utils.execute(cmd)
+        self.disk_file_path = os.path.realpath(disk_file_path)
+        self.actual_dir = self._unpack_disk()
 
-        if ret_code != 0:
-            raise Exception('Attaching RAM failed. %s' % stderr)
+    def __call__(self, op, path, *args):
+        return super(DiskManager, self).__call__(op, self.actual_dir + path, *args)
 
-        self.device_path = stdout.strip()
+    def _unpack_disk(self):
+        tmpdir = tempfile.mkdtemp(prefix='gpg_temp_')
+        self.log.info('Unpacked to %s' % tmpdir)
 
-        cmd = 'diskutil erasevolume HFS+ "{label}" {dev}'
-        cmd = cmd.format(dev=self.device_path, label=self.volume_label)
+        with tarfile.open(self.disk_file_path, 'r:bz2') as disk:
+            disk.extractall(tmpdir)
 
-        ret_code, stdout, stderr = utils.execute(cmd)
+        return tmpdir
 
-        self.mount_path = '/Volumes/%s' % self.volume_label
+    def _pack_disk(self):
+        with tarfile.open(self.disk_file_path, 'w:bz2') as disk:
+            disk.add(self.actual_dir, '.')
 
-    def destroy(self):
-        '''Clean up operations.
+    def destroy(self, private_data):
+        self._pack_disk()
+        shutil.rmtree(self.actual_dir)
+        return super(DiskManager, self).destroy(private_data)
 
-        Unmounts volume and detaches RAM disk.
 
-        '''
+    def access(self, path, mode):
+        if not os.access(path, mode):
+            raise fuse.FuseOSError(errno.EACCES)
 
-        cmd = 'diskutil umount %s' % self.volume_label
-        utils.execute(cmd)
+    chmod = os.chmod
+    chown = os.chown
 
-        cmd = 'hdiutil detach %s' % self.device_path
-        utils.execute(cmd)
+    def create(self, path, mode):
+        return os.open(path, os.O_WRONLY | os.O_CREAT, mode)
 
-    def lookup(self, parent_inode, name):
-        '''Look up a directory entry by name and get its attributes.
+    def flush(self, path, fh):
+        return os.fsync(fh)
 
-        If the entry *name* does not exist in the directory with inode
-        *parent_inode*, this method must raise `FUSEError` with an
-        errno of `errno.ENOENT`. Otherwise it must return an
-        `EntryAttributes` instance.
+    def fsync(self, path, datasync, fh):
+        return os.fsync(fh)
 
-        Once an inode has been returned by `lookup`, `create`,
-        `symlink`, `link`, `mknod` or `mkdir`, it must be kept by the
-        file system until it receives a `forget` request for the
-        inode. If `unlink` or `rmdir` requests are received prior to
-        the `forget` call, they are expect to remove only the
-        directory entry for the inode and defer removal of the inode
-        itself until the `forget` call.
+    def getattr(self, path, fh=None):
+        st = os.lstat(path)
+        return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
+            'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
 
-        The file system must be able to handle lookups for :file:`.`
-        and :file:`..`, no matter if these entries are returned by
-        `readdir` or not.
-        '''
+    getxattr = None
 
-        raise FUSEError(errno.ENOSYS)
+    def link(self, target, source):
+        return os.link(source, target)
 
-    def forget(self, inode_list):
-        '''Notify about inodes being removed from the kernel cache
+    listxattr = None
+    mkdir = os.mkdir
+    mknod = os.mknod
+    open = os.open
 
-        *inode_list* is a list of ``(inode, nlookup)`` tuples. This
-        method is called when the kernel removes the listed inodes
-        from its internal caches. *nlookup* is the number of times
-        that the inode has been looked up by calling either of the
-        `lookup`, `create`, `symlink`, `mknod`, `link` or `mkdir`
-        methods.
+    def read(self, path, size, offset, fh):
+        with self.rwlock:
+            os.lseek(fh, offset, 0)
+            return os.read(fh, size)
 
-        The file system is expected to keep track of the number of
-        times an inode has been looked up and forgotten. No request
-        handlers other than `lookup` will be called for an inode with
-        a lookup count of zero.
+    def readdir(self, path, fh):
+        return ['.', '..'] + os.listdir(path)
 
-        If the lookup count reaches zero after a call to `forget`, the
-        file system is expected to check if there are still directory
-        entries referring to this inode and, if not, delete the inode
-        itself.
+    readlink = os.readlink
 
-        If the file system is unmounted, it will may not receive
-        `forget` calls for inodes that are still cached. The `destroy`
-        method may be used to clean up any remaining inodes for which
-        no `forget` call has been received.
-        '''
+    def release(self, path, fh):
+        return os.close(fh)
 
-        pass
+    def rename(self, old, new):
+        return os.rename(old, self.actual_dir + new)
 
-    def getattr(self, inode):
-        '''Get attributes for *inode*
+    rmdir = os.rmdir
 
-        This method should return an `EntryAttributes` instance with
-        the attributes of *inode*. The
-        `~EntryAttributes.entry_timeout` attribute is ignored in this
-        context.
-        '''
+    def statfs(self, path):
+        stv = os.statvfs(path)
+        return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
+            'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
+            'f_frsize', 'f_namemax'))
 
-        raise FUSEError(errno.ENOSYS)
-
-    def setattr(self, inode, attr):
-        '''Change attributes of *inode*
-
-        *attr* is an `EntryAttributes` instance with the new
-        attributes. Only the attributes `~EntryAttributes.st_size`,
-        `~EntryAttributes.st_mode`, `~EntryAttributes.st_uid`,
-        `~EntryAttributes.st_gid`, `~EntryAttributes.st_atime` and
-        `~EntryAttributes.st_mtime` are relevant. Unchanged attributes
-        will have a value `None`.
+    def symlink(self, target, source):
+        return os.symlink(source, target)
 
-        The method should return a new `EntryAttributes` instance
-        with the updated attributes (i.e., all attributes except for
-        `~EntryAttributes.entry_timeout` should be set).
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-    def readlink(self, inode):
-        '''Return target of symbolic link
-
-        The return value must have type `bytes`.
-        '''
-
-        raise FUSEError(errno.ENOSYS)
+    def truncate(self, path, length, fh=None):
+        with open(path, 'r+') as f:
+            f.truncate(length)
 
-    def mknod(self, parent_inode, name, mode, rdev, ctx):
-        '''Create (possibly special) file
+    unlink = os.unlink
+    utimens = os.utime
 
-        *ctx* will be a `RequestContext` instance. The method must
-        return an `EntryAttributes` instance with the attributes of
-        the newly created directory entry.
-
-        Once an inode has been returned by `lookup`, `create`,
-        `symlink`, `link`, `mknod` or `mkdir`, it must be kept by the
-        file system until it receives a `forget` request for the
-        inode. If `unlink` or `rmdir` requests are received prior to
-        the `forget` call, they are expect to remove only the
-        directory entry for the inode and defer removal of the inode
-        itself until the `forget` call.
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-    def mkdir(self, parent_inode, name, mode, ctx):
-        '''Create a directory
-
-        *ctx* will be a `RequestContext` instance. The method must
-        return an `EntryAttributes` instance with the attributes of
-        the newly created directory entry.
-
-        Once an inode has been returned by `lookup`, `create`,
-        `symlink`, `link`, `mknod` or `mkdir`, it must be kept by the
-        file system until it receives a `forget` request for the
-        inode. If `unlink` or `rmdir` requests are received prior to
-        the `forget` call, they are expect to remove only the
-        directory entry for the inode and defer removal of the inode
-        itself until the `forget` call.
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-    def unlink(self, parent_inode, name):
-        '''Remove a (possibly special) file
-
-        If the file system has received a `lookup`, but no `forget`
-        call for this file yet, `unlink` is expected to remove only
-        the directory entry and defer removal of the inode with the
-        actual file contents and metadata until the `forget` call is
-        received.
-
-        Note that an unlinked file may also appear again if it gets a
-        new directory entry by the `link` method.
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-    def rmdir(self, inode_parent, name):
-        '''Remove a directory
-
-        If the file system has received a `lookup`, but no `forget`
-        call for this file yet, `unlink` is expected to remove only
-        the directory entry and defer removal of the inode with the
-        actual file contents and metadata until the `forget` call is
-        received.
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-    def symlink(self, inode_parent, name, target, ctx):
-        '''Create a symbolic link
-
-        *ctx* will be a `RequestContext` instance. The method must
-        return an `EntryAttributes` instance with the attributes of
-        the newly created directory entry.
-
-        Once an inode has been returned by `lookup`, `create`,
-        `symlink`, `link`, `mknod` or `mkdir`, it must be kept by the
-        file system until it receives a `forget` request for the
-        inode. If `unlink` or `rmdir` requests are received prior to
-        the `forget` call, they are expect to remove only the
-        directory entry for the inode and defer removal of the inode
-        itself until the `forget` call.
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-    def rename(self, inode_parent_old, name_old, inode_parent_new, name_new):
-        '''Rename a directory entry
-
-        If *name_new* already exists, it should be overwritten.
-
-        If the file system has received a `lookup`, but no `forget`
-        call for the file that is about to be overwritten, `rename` is
-        expected to only overwrite the directory entry and defer
-        removal of the old inode with the its contents and metadata
-        until the `forget` call is received.
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-    def link(self, inode, new_parent_inode, new_name):
-        '''Create a hard link.
-
-        The method must return an `EntryAttributes` instance with the
-        attributes of the newly created directory entry.
-
-        Once an inode has been returned by `lookup`, `create`,
-        `symlink`, `link`, `mknod` or `mkdir`, it must be kept by the
-        file system until it receives a `forget` request for the
-        inode. If `unlink` or `rmdir` requests are received prior to
-        the `forget` call, they are expect to remove only the
-        directory entry for the inode and defer removal of the inode
-        itself until the `forget` call.
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-    def open(self, inode, flags):
-        '''Open a file.
-
-        *flags* will be a bitwise or of the open flags described in
-        the :manpage:`open(2)` manpage and defined in the `os` module
-        (with the exception of ``O_CREAT``, ``O_EXCL``, ``O_NOCTTY``
-        and ``O_TRUNC``)
-
-        This method should return an integer file handle. The file
-        handle will be passed to the `read`, `write`, `flush`, `fsync`
-        and `release` methods to identify the open file.
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-    def read(self, fh, off, size):
-        '''Read *size* bytes from *fh* at position *off*
-
-        This function should return exactly the number of bytes
-	requested except on EOF or error, otherwise the rest of the
-	data will be substituted with zeroes.
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-    def write(self, fh, off, buf):
-        '''Write *buf* into *fh* at *off*
-
-        This method should return the number of bytes written. If no
-        error occured, this should be exactly :samp:`len(buf)`.
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-    def flush(self, fh):
-        '''Handle close() syscall.
-
-        This method is called whenever a file descriptor is closed. It
-        may be called multiple times for the same open file (e.g. if
-        the file handle has been duplicated).
-
-        If the file system implements locking, this method must clear
-        all locks belonging to the file handle's owner.
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-    def release(self, fh):
-        '''Release open file
-
-        This method will be called when the last file descriptor of
-        *fh* has been closed. Therefore it will be called exactly once
-        for each `open` call.
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-    def fsync(self, fh, datasync):
-        '''Flush buffers for open file *fh*
-
-        If *datasync* is true, only the file contents should be
-        flushed (in contrast to the metadata about the file).
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-    def opendir(self, inode):
-        '''Open a directory.
-
-        This method should return an integer file handle. The file
-        handle will be passed to the `readdir`, `fsyncdir`
-        and `releasedir` methods to identify the directory.
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-
-    def readdir(self, fh, off):
-        '''Read directory entries
-
-        This method should return an iterator over the contents of
-        directory *fh*, starting at the entry identified by *off*.
-        Directory entries must be of type `bytes`.
-
-        The iterator must yield tuples of the form :samp:`({name}, {attr},
-        {next_})`, where *attr* is an `EntryAttributes` instance and
-        *next_* gives an offset that can be passed as *off* to start
-        a successive `readdir` call at the right position.
-
-        Iteration may be stopped as soon as enough elements have been
-        retrieved. The method should be prepared for this case.
-
-        If entries are added or removed during a `readdir` cycle, they
-        may or may not be returned. However, they must not cause other
-        entries to be skipped or returned more than once.
-
-        :file:`.` and :file:`..` entries may be included but are not
-        required.
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-    def releasedir(self, fh):
-        '''Release open directory
-
-        This method must be called exactly once for each `opendir` call.
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-    def fsyncdir(self, fh, datasync):
-        '''Flush buffers for open directory *fh*
-
-        If *datasync* is true, only the directory contents should be
-        flushed (in contrast to metadata about the directory itself).
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-    def statfs(self):
-        '''Get file system statistics
-
-        The method is expected to return an appropriately filled
-        `StatvfsData` instance.
-        '''
-
-        raise FUSEError(errno.ENOSYS)
-
-
+    def write(self, path, data, offset, fh):
+        with self.rwlock:
+            os.lseek(fh, offset, 0)
+            return os.write(fh, data)

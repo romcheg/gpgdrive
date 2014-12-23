@@ -1,1 +1,2 @@
-llfuse==0.40
+fusepy
+faulthandler==2.4

@@ -1,23 +1,16 @@
 import sys
 
-import llfuse
-
+import faulthandler
+import fuse
 from gpgdisk import manager
 
 
 def main():
-    if len(sys.argv) != 2:
-        raise SystemExit('Usage: %s <mountpoint>' % sys.argv[0])
+    faulthandler.enable()
 
-    mountpoint = sys.argv[1]
-    operations = manager.MountManager()
+    if len(sys.argv) != 3:
+        print('usage: %s <disk> <mountpoint>' % sys.argv[0])
+        exit(1)
 
-    llfuse.init(operations, mountpoint, ['fsname=tmpfs', "nonempty" ])
-
-    try:
-        llfuse.main(single=True)
-    except:
-        llfuse.close(unmount=False)
-        raise
-
-    llfuse.close()
+    op_mgr = manager.DiskManager(sys.argv[1])
+    fuse_inst = fuse.FUSE(op_mgr, sys.argv[2], foreground=True)
